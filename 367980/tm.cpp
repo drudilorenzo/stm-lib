@@ -30,16 +30,13 @@
  *     Transactional locking II.
  *     In International Symposium on Distributed Computing (pp. 194-208).
  *     Berlin, Heidelberg: Springer Berlin Heidelberg.
+ * 
+ * @see 
+ * [1] https://medium.com/@talhof8/software-transactional-memory-a-stairway-to-lock-free-programming-heaven-9ca1f4dce23f
 **/
 
-/**
- * TODO:
- * - [ ] Why it initializes 0 and 1 pos
- * - [ ] What is GET VIRTUAL ADDRESS
- * - [ ] Explain map composition
- * - [ ] Change get_word function (what is &?)
- * - [ ] Why list and not vector?
-*/
+
+#pragma GCC optimize("Ofast")
 
 
 /**
@@ -59,7 +56,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
-#include <list>
+#include <set>
 #include <memory>
 #include <string.h>
 #include <unordered_map>
@@ -68,6 +65,17 @@
 
 #include "macros.h"
 #include <tm.hpp>
+
+/*
+ * Virtual memory explanation:
+ * in a 64-bit architecture, the virtual memory address is 64 bits long.
+ * The first 16 bits are used to index the segment, the remaining 48 bits.
+ * That permits to don't use new/delete or malloc/free to allocate memory.
+ * 
+ * The first segment is allocated at the address 0x1000000000000000.
+ * The second segment is allocated at the address 0x2000000000000000.
+ * And so on...
+*/
 
 // Virtual memory address length: 64 bits
 #define VIRTUAL_ADDRESS_LENGTH 64
@@ -81,20 +89,20 @@
 // Bit mask for the offset
 #define OFFSET_MASK ((uint64_t(1) << OFFSET_LENGTH) - 1)
 
-// Number of segments preallocated
-#define NUM_SEG ((uint64_t(1) << SEG_IDX_LENGTH) - 1)
+// Euristic value for the number of segments
+#define NUM_SEG 1024
 
 // Offset of the first segment
-#define START_ADDRESS 0
+#define NUM_WORDS 0
 
 // Get the segment index from the virtual address
-#define GET_SEG_IDX(x) ((uint64_t)x >> OFFSET_LENGTH)
+#define GET_SEG_IDX(vaddr) ((uint64_t)vaddr >> OFFSET_LENGTH)
 
 // Get the offset from the virtual address
-#define GET_OFFSET(x, align) (((uint64_t)x & OFFSET_MASK) / align)
+#define GET_OFFSET(vaddr, align) (((uint64_t)vaddr & OFFSET_MASK) / align)
 
-// TODO: understand
-#define GET_VIRTUAL_ADDRESS(x) ((uint64_t)x << OFFSET_LENGTH)
+// Get the first byte of the nth segment
+#define GET_VIRTUAL_ADDRESS(nth) ((uint64_t)nth << OFFSET_LENGTH)
 
 #define LOCKED_MASK 1
 #define VERSION_SHIFT 1
@@ -119,16 +127,17 @@
 
 
 typedef struct transaction_t {
-    bool is_read_only = false;                           // True if the transaction is read-only
+    bool is_read_only;                                   // True if the transaction is read-only
     uint64_t read_version;                               // Read version
     uint64_t write_version;                              // Write version
-    std::unordered_set<std::atomic_uint64_t *> read_set; // Word -> value
-    std::unordered_map<uintptr_t, uint64_t> write_set;   // Word -> value
+    std::unordered_map<uintptr_t, uint64_t> write_set;   // Address of the word and value to write
+    std::unordered_set<std::atomic_uint64_t *> read_set; // Set of locks (used to check if the versions are up-to-date)
+    transaction_t() : is_read_only(false), read_version(0), write_version(0) {}
 } transaction_t;
 
 typedef struct word_t {
     uint64_t value;            // 64-bit value
-    std::atomic_uint64_t lock; // Versioning lock
+    std::atomic_uint64_t lock; // Versioning lock (Lock 1 bit (lsb) + Version 63 bits)
     word_t() : value(0), lock(0) {}
     word_t(const word_t &w) : value(w.value), lock(w.lock.load()) {}
 } word_t;
@@ -136,12 +145,21 @@ typedef struct word_t {
 typedef struct stm_t {
     size_t size;                             // Size of the first allocated segment (in bytes)
     size_t align;                            // Alignment that the region must provide (in bytes)
-    std::atomic_uint64_t next = 1;           // Number of allocated segments
+    std::atomic_uint64_t next = 1;               // Number of allocated segments
     std::vector<std::vector<word_t>> memory; // Array of segments (each segment is an array of words)
-    stm_t() : memory(NUM_SEG, std::vector<word_t>(START_ADDRESS)) {}
+    stm_t() : memory(NUM_SEG, std::vector<word_t>(NUM_WORDS)) {}
 } stm_t;
 
-static std::atomic_uint64_t global_clock = 0; // global version clock
+
+/*
+ * GLOBAL VARIABLES
+ */
+
+
+// global version clock
+static std::atomic_uint64_t global_clock = 0;
+
+// static variables to avoid dynamic memory allocation
 static thread_local transaction_t gtransaction;
 static stm_t gstm;
 
@@ -151,11 +169,10 @@ static stm_t gstm;
  */
 
 
-inline word_t &get_word(stm_t *smt, const uintptr_t addr);
-inline bool acquire_lock(std::atomic_uint64_t *lock);
-inline bool release_lock(std::atomic_uint64_t *lock, const uint64_t new_version);
+inline bool try_to_lock(std::atomic_uint64_t *lock);
+inline bool try_to_unlock(std::atomic_uint64_t *lock, const uint64_t new_version);
 inline void clean_transaction(transaction_t *transaction);
-inline void release_locks_from_list(const std::list<word_t *> locks);
+inline void release_locks_from_set(const std::set<word_t *> locks);
 
 
 /*
@@ -230,8 +247,10 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     stm_t *reg = (stm_t *)shared;
     transaction_t *transaction = (transaction_t *)tx;
 
+    // iterator to the last inserted element, used to speed up the insertion
+    auto last_pos(end(transaction->write_set));
     for (size_t i = 0, t = (size_t)target, s = (size_t)source; i < size / reg->align; i++, t += reg->align, s += reg->align) {
-        transaction->write_set.insert_or_assign(t, (*(uint64_t *)s));
+        last_pos = transaction->write_set.insert_or_assign(last_pos, t, (*(uint64_t *)s));
     }
 
   return true;
@@ -248,9 +267,11 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) noexcept {
     stm_t *stm = (stm_t *)shared;
     transaction_t *transaction = (transaction_t *)tx;
-     
-    auto hint(end(transaction->read_set));
+ 
     uint64_t version_before;
+    word_t *word;
+
+    auto last_pos(end(transaction->read_set));
     for (size_t i = 0, address = (size_t)source, t = (size_t)target; i < size / stm->align; i++, address += stm->align, t += stm->align) {
 
         // check if the word is in the write set
@@ -262,27 +283,26 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             }
         }
 
-        word_t &word = get_word(stm, address);
-
-        version_before = GET_VERSION(word.lock.load());
+        word = &stm->memory[GET_SEG_IDX(address)][GET_OFFSET(address, stm->align)];
+        version_before = GET_VERSION(word->lock.load());
 
         // If the word version is not up-to-date, abort the transaction
         if (version_before > transaction->read_version) {
             ABORT(transaction);
         }
 
-        *(uint64_t*)t = word.value;
+        *(uint64_t*)t = word->value;
         
         if (!transaction->is_read_only) {
-            hint = transaction->read_set.emplace_hint(hint, &word.lock);
-            if (IS_LOCKED(word.lock.load())) {
+            last_pos = transaction->read_set.insert(last_pos, &word->lock);
+            if (IS_LOCKED(word->lock.load())) {
                 ABORT(transaction);
             }
         }    
 
         // If the version after the read is greater than the version before, 
         // then the word has been updated by another transaction.
-        if (GET_VERSION(word.lock.load()) != version_before || IS_LOCKED(word.lock.load())) {
+        if (GET_VERSION(word->lock.load()) != version_before || IS_LOCKED(word->lock.load())) {
             ABORT(transaction);
         }
     }
@@ -297,7 +317,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 **/
 bool tm_end(shared_t shared, tx_t tx) noexcept {
     transaction_t *transaction = (transaction_t *)tx;
-    stm_t *reg = (stm_t *)shared;
+    stm_t *stm = (stm_t *)shared;
 
     // If the transaction is read-only, commit it
     if (transaction->is_read_only || transaction->write_set.empty()) {
@@ -305,16 +325,18 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     }
 
     // need to store the lock to be able to release them later
-    std::list<word_t *> locks;
+    std::set<word_t *> locks;
+    auto last_pos(end(locks));
+    word_t *word;
 
     // try to acquire the locks
-    for (const auto v : transaction->write_set) {
-        word_t &vlock = get_word(reg, v.first);
-        if (!acquire_lock(&vlock.lock)) {
-            release_locks_from_list(locks);
+    for (const auto ws_entry : transaction->write_set) {
+        word = &stm->memory[GET_SEG_IDX(ws_entry.first)][GET_OFFSET(ws_entry.first, stm->align)];
+        if (!try_to_lock(&word->lock)) {
+            release_locks_from_set(locks);
             ABORT(transaction);
         }
-        locks.push_back(&vlock);
+        last_pos = locks.insert(last_pos, word);
     }
 
     transaction->write_version = ATOMIC_FETCH_INC(global_clock);
@@ -322,19 +344,19 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     // ensure that anything is changed in the read-set (no concurrent actors)
     if (transaction->read_version != transaction->write_version - 1) {
         uint64_t v;
-        for (const std::atomic_uint64_t *l : transaction->read_set) {
-            v = l->load();
+        for (const std::atomic_uint64_t *rs_entry : transaction->read_set) {
+            v = rs_entry->load();
             if (IS_LOCKED(v) || GET_VERSION(v) > transaction->read_version) {
-                release_locks_from_list(locks);
+                release_locks_from_set(locks);
                 ABORT(transaction);
             }
         }
     }
 
-    for (const auto v : transaction->write_set) {
-        word_t &vlock = get_word(reg, v.first);
-        vlock.value = v.second;
-        if (!release_lock(&vlock.lock, transaction->write_version)) {
+    for (const auto ws_entry : transaction->write_set) {
+        word = &stm->memory[GET_SEG_IDX(ws_entry.first)][GET_OFFSET(ws_entry.first, stm->align)];
+        word->value = ws_entry.second;
+        if (!try_to_unlock(&word->lock, transaction->write_version)) {
             ABORT(transaction);
         }
     }
@@ -350,7 +372,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **target) noexcept {
+Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noexcept {
     stm_t *stm = ((stm_t *)shared);
     *target = (void *)(GET_VIRTUAL_ADDRESS((ATOMIC_FETCH_INC(stm->next))));
     stm->memory[stm->next.load()].resize(size / stm->align);
@@ -374,22 +396,13 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(segment)) no
  */
 
 
-/** Get the word from the virtual memory.
- * @param reg Shared memory region
- * @param addr Virtual address
- * @return Word
-*/
-inline word_t &get_word(stm_t *smt, const uintptr_t addr) {
-  return smt->memory[GET_SEG_IDX(addr)][GET_OFFSET(addr, smt->align)];
-}
-
 /** Acquire a lock.
  * @param lock Lock to acquire
  * @return Whether the lock has been acquired
 */
-inline bool acquire_lock(std::atomic_uint64_t *lock) {
+inline bool try_to_lock(std::atomic_uint64_t *lock) {
     uint64_t v = lock->load();
-    return IS_LOCKED(v) ? false : lock->compare_exchange_strong(v, CREATE_VERSION(true, GET_VERSION(v)));
+    return IS_LOCKED(v) ? false : lock->compare_exchange_weak(v, CREATE_VERSION(true, GET_VERSION(v)));
 }
 
 /** Release a lock.
@@ -397,9 +410,9 @@ inline bool acquire_lock(std::atomic_uint64_t *lock) {
  * @param new_version New version to set
  * @return Whether the lock has been released
 */
-inline bool release_lock(std::atomic_uint64_t *lock, const uint64_t new_version) {
+inline bool try_to_unlock(std::atomic_uint64_t *lock, const uint64_t new_version) {
     uint64_t v = lock->load();
-    return !(IS_LOCKED(v)) ? false : lock->compare_exchange_strong(v, CREATE_VERSION(false, new_version));
+    return !(IS_LOCKED(v)) ? false : lock->compare_exchange_weak(v, CREATE_VERSION(false, new_version));
  }
 
 /** Clean the transaction state.
@@ -408,12 +421,10 @@ inline bool release_lock(std::atomic_uint64_t *lock, const uint64_t new_version)
 inline void clean_transaction(transaction_t *transaction) {
     transaction->write_set.clear();
     transaction->read_set.clear();
-    transaction->read_version = 0;
-    transaction->is_read_only = false;
 }
 
-inline void release_locks_from_list(const std::list<word_t *> locks) {
-    for (const auto &vlock : locks) {
-        release_lock(&vlock->lock, GET_VERSION(vlock->lock.load()));
+inline void release_locks_from_set(const std::set<word_t *> words) {
+    for (const auto &word : words) {
+        try_to_unlock(&word->lock, GET_VERSION(word->lock.load()));
     }
 }
