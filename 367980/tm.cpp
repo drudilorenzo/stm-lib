@@ -249,7 +249,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
     // iterator to the last inserted element, used to speed up the insertion
     auto last_pos(end(transaction->write_set));
-    for (size_t i = 0, t = (size_t)target, s = (size_t)source; i < size / reg->align; i++, t += reg->align, s += reg->align) {
+    for (size_t t = (size_t)target, s = (size_t)source; s < (size_t)source + size; t += reg->align, s += reg->align) {
         last_pos = transaction->write_set.insert_or_assign(last_pos, t, (*(uint64_t *)s));
     }
 
@@ -272,7 +272,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     word_t *word;
 
     auto last_pos(end(transaction->read_set));
-    for (size_t i = 0, address = (size_t)source, t = (size_t)target; i < size / stm->align; i++, address += stm->align, t += stm->align) {
+    for (size_t address = (size_t)source, t = (size_t)target; address < (size_t)source + size; address += stm->align, t += stm->align) {
 
         // check if the word is in the write set
         if (!transaction->is_read_only) {
