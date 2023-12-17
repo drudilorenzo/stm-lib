@@ -56,7 +56,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
-#include <set>
+#include <list>
 #include <memory>
 #include <string.h>
 #include <unordered_map>
@@ -89,8 +89,8 @@
 // Bit mask for the offset
 #define OFFSET_MASK ((uint64_t(1) << OFFSET_LENGTH) - 1)
 
-// Euristic value for the number of segments
-#define NUM_SEG 1024
+// Max addressable segments
+#define NUM_SEG 65536 // 2^16 
 
 // Offset of the first segment
 #define NUM_WORDS 0
@@ -112,10 +112,10 @@
 #define IS_LOCKED(lock) (lock & LOCKED_MASK)
 
 // Create a lock from a version and a locked bit
-#define CREATE_VERSION(lock, version) (lock | (version << VERSION_SHIFT))
+#define CREATE_VERSION(lock, version) ((uint64_t)lock | (version << VERSION_SHIFT))
 
 // Need +1 because fetch_add returns the previous value
-#define ATOMIC_FETCH_INC(atom) (atom.fetch_add(1) + 1)
+#define ATOMIC_INC_AND_RETURN(atom) (atom.fetch_add(1) + 1)
 
 #define COMMIT(transaction) clean_transaction(transaction); return true;
 #define ABORT(transaction) clean_transaction(transaction); return false;
@@ -172,7 +172,7 @@ static stm_t gstm;
 inline bool try_to_lock(std::atomic_uint64_t *lock);
 inline bool try_to_unlock(std::atomic_uint64_t *lock, const uint64_t new_version);
 inline void clean_transaction(transaction_t *transaction);
-inline void release_locks_from_set(const std::set<word_t *> locks);
+inline void release_locks_from_list(const std::list<word_t *> locks);
 
 
 /*
@@ -292,17 +292,15 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         }
 
         *(uint64_t*)t = word->value;
+        uint64_t version_after = word->lock.load();
         
         if (!transaction->is_read_only) {
-            last_pos = transaction->read_set.insert(last_pos, &word->lock);
-            if (IS_LOCKED(word->lock.load())) {
-                ABORT(transaction);
-            }
+            last_pos = transaction->read_set.emplace_hint(last_pos, &word->lock);
         }    
 
         // If the version after the read is greater than the version before, 
         // then the word has been updated by another transaction.
-        if (GET_VERSION(word->lock.load()) != version_before || IS_LOCKED(word->lock.load())) {
+        if (GET_VERSION(version_after) != version_before || IS_LOCKED(version_after)) {
             ABORT(transaction);
         }
     }
@@ -325,7 +323,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     }
 
     // need to store the lock to be able to release them later
-    std::set<word_t *> locks;
+    std::list<word_t *> locks;
     auto last_pos(end(locks));
     word_t *word;
 
@@ -333,13 +331,13 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     for (const auto ws_entry : transaction->write_set) {
         word = &stm->memory[GET_SEG_IDX(ws_entry.first)][GET_OFFSET(ws_entry.first, stm->align)];
         if (!try_to_lock(&word->lock)) {
-            release_locks_from_set(locks);
+            release_locks_from_list(locks);
             ABORT(transaction);
         }
         last_pos = locks.insert(last_pos, word);
     }
 
-    transaction->write_version = ATOMIC_FETCH_INC(global_clock);
+    transaction->write_version = ATOMIC_INC_AND_RETURN(global_clock);
 
     // ensure that anything is changed in the read-set (no concurrent actors)
     if (transaction->read_version != transaction->write_version - 1) {
@@ -347,7 +345,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
         for (const std::atomic_uint64_t *rs_entry : transaction->read_set) {
             v = rs_entry->load();
             if (IS_LOCKED(v) || GET_VERSION(v) > transaction->read_version) {
-                release_locks_from_set(locks);
+                release_locks_from_list(locks);
                 ABORT(transaction);
             }
         }
@@ -374,7 +372,7 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
 **/
 Alloc tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void **target) noexcept {
     stm_t *stm = ((stm_t *)shared);
-    *target = (void *)(GET_VIRTUAL_ADDRESS((ATOMIC_FETCH_INC(stm->next))));
+    *target = (void *)(GET_VIRTUAL_ADDRESS((ATOMIC_INC_AND_RETURN(stm->next))));
     stm->memory[stm->next.load()].resize(size / stm->align);
     return Alloc::success;
 }
@@ -402,7 +400,7 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(segment)) no
 */
 inline bool try_to_lock(std::atomic_uint64_t *lock) {
     uint64_t v = lock->load();
-    return IS_LOCKED(v) ? false : lock->compare_exchange_weak(v, CREATE_VERSION(true, GET_VERSION(v)));
+    return IS_LOCKED(v) ? false : lock->compare_exchange_strong(v, CREATE_VERSION(true, GET_VERSION(v)));
 }
 
 /** Release a lock.
@@ -412,7 +410,7 @@ inline bool try_to_lock(std::atomic_uint64_t *lock) {
 */
 inline bool try_to_unlock(std::atomic_uint64_t *lock, const uint64_t new_version) {
     uint64_t v = lock->load();
-    return !(IS_LOCKED(v)) ? false : lock->compare_exchange_weak(v, CREATE_VERSION(false, new_version));
+    return !(IS_LOCKED(v)) ? false : lock->compare_exchange_strong(v, CREATE_VERSION(false, new_version));
  }
 
 /** Clean the transaction state.
@@ -421,9 +419,11 @@ inline bool try_to_unlock(std::atomic_uint64_t *lock, const uint64_t new_version
 inline void clean_transaction(transaction_t *transaction) {
     transaction->write_set.clear();
     transaction->read_set.clear();
+    transaction->is_read_only = false;
+    transaction->read_version = 0;
 }
 
-inline void release_locks_from_set(const std::set<word_t *> words) {
+inline void release_locks_from_list(const std::list<word_t *> words) {
     for (const auto &word : words) {
         try_to_unlock(&word->lock, GET_VERSION(word->lock.load()));
     }
